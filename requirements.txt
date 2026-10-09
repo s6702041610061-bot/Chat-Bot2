@@ -1,0 +1,4 @@
+google-genai==2.29.0
+numpy==2.5.3
+python-dotenv==1.2.4
+streamlit==1.65.0

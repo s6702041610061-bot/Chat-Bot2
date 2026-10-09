@@ -1,0 +1,135 @@
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+
+import numpy as np
+
+BASE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(BASE))
+from chatbot import answer_question, generate_json, rewrite_question, QUERY_SCHEMA
+from google.genai import errors
+from rag import Chunk, CurriculumIndex, Synonyms, load_index, parse_curriculum
+
+
+class RagTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.synonyms = Synonyms(BASE / "synonyms.json")
+        cls.chunks = parse_curriculum(BASE / "TCT69_Curriculum.md")
+
+    def test_real_curriculum_metadata_and_page_boundaries(self):
+        document_pages = {c.pdf_page for c in self.chunks if c.kind != 'external'}
+        self.assertEqual(document_pages, set(range(5, 189)) - {185})
+        external = [c for c in self.chunks if c.kind == 'external']
+        self.assertEqual({c.pdf_page for c in external}, {900})
+        self.assertTrue(any('LINE Official: @sa.kmutnb' in c.text for c in external))
+        self.assertEqual(len({c.id for c in self.chunks}), len(self.chunks))
+        credit = next(c for c in self.chunks if '139 หน่วยกิต' in c.text)
+        self.assertEqual((credit.pdf_page, credit.printed_page, credit.kind), (31, '27', 'main'))
+
+    def test_aliases_without_english_substring_collisions(self):
+        self.assertIn('ค่าเทอม', self.synonyms.terms('ค่าเล่าเรียน'))
+        self.assertIn('เทคโนโลยีสารสนเทศ', self.synonyms.terms('ปวช. ไอที'))
+        self.assertIn('ภาคการศึกษาที่ 2', self.synonyms.terms('ปีหนึ่งเทอมสอง'))
+        self.assertNotIn('สอบตก', self.synonyms.terms('flash'))
+        self.assertNotIn('ประกาศนียบัตรวิชาชีพ', self.synonyms.terms('ประกาศนียบัตรวิชาชีพชั้นสูง'))
+        self.assertIn('หน่วยกิต', self.synonyms.terms('OOP กี่เครดิต'))
+        self.assertNotIn('หน่วยกิตรวมตลอดหลักสูตร', self.synonyms.terms('OOP กี่เครดิต'))
+
+    def test_historical_records_keep_both_years(self):
+        comparisons = [c for c in self.chunks if c.kind == 'comparison']
+        self.assertTrue(comparisons)
+        self.assertTrue(any('หลักสูตรฉบับปี พ.ศ.2564' in c.text and
+                            'หลักสูตรปรับปรุง พ.ศ.2569' in c.text for c in comparisons))
+
+    @patch('rag.time.sleep')
+    @patch('rag.embed')
+    def test_cache_reuse_and_invalidation(self, embedding, sleep):
+        embedding.side_effect = lambda client, texts, model, task, dimensions: np.ones((len(texts), dimensions), dtype=np.float32) / np.sqrt(dimensions)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / 'source.md'
+            source.write_text('<!-- source-page: 005; printed-page: 1; category: 1 -->\n#### หลักสูตร\nข้อมูล ก', encoding='utf-8')
+            first = load_index(source, BASE/'synonyms.json', root/'cache', None)
+            calls = embedding.call_count
+            second = load_index(source, BASE/'synonyms.json', root/'cache', None)
+            self.assertEqual(calls, embedding.call_count)
+            np.testing.assert_array_equal(first.vectors, second.vectors)
+            source.write_text(source.read_text(encoding='utf-8') + '\nข้อมูล ข', encoding='utf-8')
+            load_index(source, BASE/'synonyms.json', root/'cache', None)
+            self.assertGreater(embedding.call_count, calls)
+
+    @patch('rag.embed', return_value=np.array([[1., 0.]], dtype=np.float32))
+    def test_history_filter_and_page_expansion(self, embedding):
+        chunks = [Chunk('a', 'หน่วยกิตรวม 139', 3, '27', 31, '2569', 'main', 'หน่วยกิต', 'x.md'),
+                  Chunk('b', 'วิชาเลือกเสรี 6 หน่วยกิต', 3, '27', 31, '2569', 'main', 'วิชาเลือก', 'x.md'),
+                  Chunk('c', 'หน่วยกิตรวม 142', 9, '138', 142, '2564/2569', 'comparison', 'หน่วยกิต', 'x.md')]
+        index = CurriculumIndex(chunks, np.array([[1.,0.],[.8,.2],[1.,0.]]), self.synonyms, 'fake', 2)
+        current = index.search(None, 'หน่วยกิตรวม', 3)
+        self.assertEqual(len(current), 1)
+        self.assertIn('วิชาเลือกเสรี 6', current[0][0].text)
+        history = index.search(None, 'หน่วยกิตรวม 2564', 3)
+        self.assertTrue(any(c.kind == 'comparison' for c, _ in history))
+
+    @patch('chatbot.generate_json')
+    def test_followup_receives_history_and_topic_change(self, generate):
+        generate.return_value = {'question': 'ปี 1 ภาคการศึกษาที่ 2 เรียนอะไร', 'needs_clarification': False, 'clarification': ''}
+        history = [{'role': 'user', 'content': 'ปีหนึ่งเทอมแรกเรียนอะไร'}]
+        result = rewrite_question(None, 'fake', 'แล้วเทอมสองล่ะ', history)
+        payload = json.loads(generate.call_args.args[3])
+        self.assertEqual(payload['history'], history)
+        self.assertEqual(result['question'], generate.return_value['question'])
+
+    @patch('chatbot.generate_json')
+    def test_self_contained_topic_does_not_inherit_old_semester(self, generate):
+        result = rewrite_question(None, 'fake', 'ค่าเล่าเรียนเท่าไร', [
+            {'role':'user','content':'ปีหนึ่งเทอมสองเรียนอะไร'},
+            {'role':'assistant','content':'ปีหนึ่งเทอมสองเรียนรวม 18 หน่วยกิต'}])
+        self.assertEqual(result['question'], 'ค่าเล่าเรียนเท่าไร')
+        generate.assert_not_called()
+
+    @patch('chatbot.generate_json')
+    def test_clarification_does_not_retrieve(self, generate):
+        generate.return_value = {'question': '', 'needs_clarification': True, 'clarification': 'หมายถึงวิชาใดคะ'}
+        result = answer_question(None, None, 'fake', 'วิชานั้นล่ะ', [{'role':'user','content':'สองวิชานี้'}])
+        self.assertEqual(result['sources'], [])
+
+    @patch('chatbot.generate_json')
+    def test_rejects_fabricated_source_ids(self, generate):
+        class Index:
+            def search(self, *args):
+                return [(RagTests.chunks[0], .8)]
+        generate.return_value = {'answer': 'คำตอบ [S99]', 'source_ids':['S99']}
+        with self.assertRaises(ValueError):
+            answer_question(None, Index(), 'fake', 'คำถาม', [])
+
+    @patch('chatbot.generate_json')
+    def test_unanswered_question_adds_department_contact_once(self, generate):
+        class Index:
+            def search(self, *args):
+                return [(RagTests.chunks[0], .8)]
+        generate.return_value = {'answer': 'ไม่พบข้อมูลนี้ในเอกสารหลักสูตรที่ใช้', 'source_ids': []}
+        result = answer_question(None, Index(), 'fake', 'คำถามนอกเอกสาร', [])
+        self.assertEqual(result['content'].count('https://ced.kmutnb.ac.th/'), 1)
+        self.assertIn('Facebook: computer Education', result['content'])
+        self.assertIn('02-555-2000 ต่อ 3240', result['content'])
+
+    @patch('chatbot.time.sleep')
+    def test_temporarily_unavailable_model_retries(self, sleep):
+        from unittest.mock import Mock
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            errors.ServerError(503, {'error': {'message':'temporarily unavailable'}}),
+            SimpleNamespace(text='{"question":"หลักสูตร", "needs_clarification":false, "clarification":""}')]
+        result = generate_json(client, 'gemini-3.8-flash', 'instruction', 'payload', QUERY_SCHEMA)
+        self.assertEqual(result['question'], 'หลักสูตร')
+        self.assertEqual(client.models.generate_content.call_count, 2)
+        sleep.assert_called_once()
+
+
+if __name__ == '__main__':
+    unittest.main()
