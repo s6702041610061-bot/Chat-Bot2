@@ -143,12 +143,20 @@ def parse_curriculum(path: Path) -> list[Chunk]:
     return chunks
 
 
+class EmbeddingServiceError(RuntimeError):
+    """Safe, actionable retrieval errors for the chat UI."""
+
+
 def embed(client, texts: list[str], model: str, task: str, dimensions: int) -> np.ndarray:
-    for attempt in range(6):
+    query = task == "RETRIEVAL_QUERY"
+    attempts = 3 if query else 6
+    for attempt in range(attempts):
         try:
             response = client.models.embed_content(
                 model=model, contents=texts,
-                config=types.EmbedContentConfig(task_type=task, output_dimensionality=dimensions))
+                config=types.EmbedContentConfig(task_type=task, output_dimensionality=dimensions,
+                    http_options=types.HttpOptions(timeout=15000,
+                        retry_options=types.HttpRetryOptions(attempts=1)) if query else None))
             vectors = np.asarray([item.values for item in response.embeddings or []], dtype=np.float32)
             if vectors.shape != (len(texts), dimensions) or not np.isfinite(vectors).all():
                 raise ValueError("บริการ embedding ส่งข้อมูลไม่ครบหรือขนาดเวกเตอร์ไม่ตรง")
@@ -157,11 +165,28 @@ def embed(client, texts: list[str], model: str, task: str, dimensions: int) -> n
                 raise ValueError("พบ embedding ที่ไม่มีค่า")
             return vectors / norms
         except errors.APIError as error:
-            if error.code not in (429, 500, 502, 503, 504) or attempt == 5:
+            # Daily quotas are described in structured details, not always in message.
+            details = json.dumps(error.details, ensure_ascii=False, default=str)
+            if error.code == 429 and re.search(r"PerDay|per.day|daily", details, re.I):
+                raise EmbeddingServiceError(
+                    "โควตา Gemini สำหรับค้นด้วย embedding รายวันหมดแล้ว "
+                    "กรุณารอรอบโควตาใหม่ หรือเปิดการเรียกเก็บเงินใน Google AI Studio "
+                    "เครดิต DeepSeek ใช้แทนโควตา Gemini ไม่ได้") from None
+            if query and error.code in (401, 403):
+                raise EmbeddingServiceError(
+                    "Gemini ไม่อนุญาตให้ค้นด้วย embedding กรุณาตรวจคีย์และสิทธิ์ของ GEMINI_API_KEY") from None
+            if error.code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt == attempts - 1:
+                if query:
+                    raise EmbeddingServiceError(
+                        "บริการ embedding ของ Gemini ยังไม่พร้อมหรือจำกัดจำนวนคำขอ "
+                        "กรุณารอสักครู่แล้วลองใหม่") from None
                 raise
             suggested = re.search(r"retry in ([\d.]+)s", error.message or "", re.I)
-            delay = max(2 ** attempt, float(suggested.group(1)) + 1 if suggested else
+            delay = (2 ** (attempt + 1) if query else max(2 ** attempt, float(suggested.group(1)) + 1 if suggested else
                         30 if error.code == 429 else 0)
+                    )
             time.sleep(min(delay, 60))
     raise RuntimeError("ไม่สามารถสร้าง embedding ได้")
 
@@ -303,6 +328,7 @@ def load_index(source: Path, synonyms_path: Path, cache_dir: Path, client,
     cache = cache_dir / f"{identity}.npz"
     rebuild_dir = cache_dir / f"{identity}.rebuild"
     chunks, vectors = parse_curriculum(source), None
+    public_dir = source.parent / "embeddings"
     if cache.exists() and not force_rebuild:
         try:
             with np.load(cache, allow_pickle=False) as saved:
@@ -311,6 +337,33 @@ def load_index(source: Path, synonyms_path: Path, cache_dir: Path, client,
                     vectors = candidate
         except (ValueError, OSError, KeyError):
             pass
+    if vectors is None and not force_rebuild:
+        # The exported index can restore an ignored/deleted runtime cache.
+        # Validate provenance and order before trusting its vectors.
+        restored = None
+        try:
+            metadata = json.loads((public_dir / "curriculum_metadata.json").read_text(encoding="utf-8"))
+            if (metadata.get("model") == model and metadata.get("dimensions") == dimensions
+                    and metadata.get("parser_version") == PARSER_VERSION
+                    and metadata.get("source_sha256") == hashlib.sha256(source.read_bytes()).hexdigest()
+                    and metadata.get("chunks") == [asdict(c) for c in chunks]):
+                with np.load(public_dir / "curriculum_embeddings.npz", allow_pickle=False) as saved:
+                    candidate = saved["vectors"]
+                if (candidate.shape == (len(chunks), dimensions) and np.isfinite(candidate).all()
+                        and np.all(np.linalg.norm(candidate, axis=1) > 0)):
+                    restored = (candidate, metadata)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        if restored is not None:
+            candidate, metadata = restored
+            temporary = cache.with_suffix(f".{uuid4().hex}.tmp")
+            shutil.copyfile(public_dir / "curriculum_embeddings.npz", temporary)
+            temporary.replace(cache)
+            manifest = cache.with_suffix(".json")
+            temporary_manifest = manifest.with_suffix(f".{uuid4().hex}.tmp")
+            temporary_manifest.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+            temporary_manifest.replace(manifest)
+            vectors = candidate
     if vectors is None:
         vectors = np.empty((len(chunks), dimensions), dtype=np.float32)
         filled = np.zeros(len(chunks), dtype=bool)
@@ -371,7 +424,6 @@ def load_index(source: Path, synonyms_path: Path, cache_dir: Path, client,
             "chunks": [asdict(c) for c in chunks]}, ensure_ascii=False), encoding="utf-8")
     # Keep a human-readable copy alongside the project so the generated
     # embedding is inspectable. The hashed cache remains the runtime source.
-    public_dir = source.parent / "embeddings"
     public_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(cache, public_dir / "curriculum_embeddings.npz")
     manifest_source = cache.with_suffix(".json")

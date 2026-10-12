@@ -9,8 +9,8 @@ from google import genai
 from google.genai import types
 import streamlit as st
 
-from chatbot import DEFAULT_MODEL, ChatServiceError, add_contact_fallback, answer_question
-from rag import EMBEDDING_MODEL, load_index
+from chatbot import DEFAULT_MODEL, ChatServiceError, add_contact_fallback, answer_question, create_chat_client
+from rag import EMBEDDING_MODEL, EmbeddingServiceError, load_index
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "TCT69_Curriculum.md"
@@ -530,8 +530,13 @@ def render_header():
 
 
 @st.cache_resource(show_spinner=False)
-def get_client(api_key: str):
+def get_embedding_client(api_key: str):
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=60000))
+
+
+@st.cache_resource(show_spinner=False)
+def get_chat_client(api_key: str):
+    return create_chat_client(api_key)
 
 
 @st.cache_resource(show_spinner=False)
@@ -539,7 +544,7 @@ def get_index(source_hash: str, synonyms_hash: str, embedding_model: str, api_ke
     # Hashes invalidate the in-memory cache when either source file changes.
     progress = st.progress(0, text="กำลังเตรียมฐานความรู้หลักสูตร...")
     try:
-        return load_index(DATA_PATH, SYNONYMS_PATH, CACHE_DIR, get_client(api_key),
+        return load_index(DATA_PATH, SYNONYMS_PATH, CACHE_DIR, get_embedding_client(api_key),
                           model=embedding_model,
                           progress=lambda done, total: progress.progress(
                               done / total, text=f"กำลังเตรียมข้อมูล {done}/{total}"))
@@ -575,9 +580,10 @@ def main():
     )
     apply_styles()
     render_header()
-    api_key = (os.getenv("GEMINI_API_KEY", "").strip()
+    embedding_key = (os.getenv("GEMINI_API_KEY", "").strip()
                or os.getenv("GEMINI_API_KEY_INSURVERSE", "").strip())
-    model = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    chat_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    model = os.getenv("DEEPSEEK_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
     embedding_model = os.getenv("GEMINI_EMBEDDING_MODEL", EMBEDDING_MODEL).strip() or EMBEDDING_MODEL
     try:
         source_hash = hashlib.sha256(DATA_PATH.read_bytes()).hexdigest()
@@ -585,7 +591,7 @@ def main():
     except OSError:
         st.error("ไม่พบไฟล์หลักสูตรหรือรายการคำที่เกี่ยวข้อง กรุณาตรวจโฟลเดอร์ workaw")
         st.stop()
-    identity = source_hash + synonyms_hash + embedding_model
+    identity = source_hash + synonyms_hash + embedding_model + model
     if st.session_state.get("knowledge_identity") != identity:
         st.session_state["messages"] = [{"role": "assistant", "content": GREETING}]
         st.session_state["knowledge_identity"] = identity
@@ -605,8 +611,13 @@ def main():
         render_message(message)
     if st.session_state.get("last_error"):
         st.error(st.session_state["last_error"])
-    if not api_key or api_key.startswith("ใส่_"):
-        st.warning("กรุณาตั้งค่า GEMINI_API_KEY ใน workaw/.env ก่อนเริ่มสนทนา")
+    missing = []
+    if not chat_key or chat_key.startswith(("ใส่", "<", "your")):
+        missing.append("DEEPSEEK_API_KEY สำหรับตอบคำถาม")
+    if not embedding_key or embedding_key.startswith(("ใส่", "<", "your")):
+        missing.append("GEMINI_API_KEY สำหรับค้นด้วย embedding")
+    if missing:
+        st.warning("กรุณาตั้งค่า " + " และ ".join(missing) + " ใน workaw/.env ก่อนเริ่มสนทนา")
         st.chat_input("พิมพ์คำถามเกี่ยวกับหลักสูตร", disabled=True)
         return
     pending = st.session_state["messages"][-1]["role"] == "user"
@@ -621,12 +632,13 @@ def main():
         history = st.session_state["messages"][1:-1]
         try:
             with st.spinner("กำลังค้นข้อมูลหลักสูตร..."):
-                index = get_index(source_hash, synonyms_hash, embedding_model, api_key)
-                response = answer_question(get_client(api_key), index, model, latest, history)
+                index = get_index(source_hash, synonyms_hash, embedding_model, embedding_key)
+                response = answer_question(get_chat_client(chat_key), index, model, latest, history,
+                                           embedding_client=get_embedding_client(embedding_key))
             st.session_state["messages"].append({"role": "assistant", **response})
             st.session_state.pop("last_error", None)
             st.rerun()
-        except ChatServiceError as error:
+        except (ChatServiceError, EmbeddingServiceError) as error:
             st.session_state["last_error"] = add_contact_fallback(str(error))
             st.rerun()
         except Exception:

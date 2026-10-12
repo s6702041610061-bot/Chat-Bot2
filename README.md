@@ -15,11 +15,36 @@ python -m pip install -r workaw/requirements.txt
 python -m streamlit run workaw/app.py
 ```
 
-ตั้งค่า `GEMINI_API_KEY` ใน `workaw/.env` ตาม `.env.example`
-`GEMINI_MODEL` เป็นโมเดลตอบคำถาม; `GEMINI_EMBEDDING_MODEL` ค่าเริ่มต้น
+สร้างคีย์ในหน้า API keys ของ DeepSeek Platform แล้วตั้งค่าใน `workaw/.env`
+ตาม `.env.example` (เก็บคีย์จริงไว้ในเครื่อง):
+
+```dotenv
+DEEPSEEK_API_KEY=ใส่คีย์_DeepSeek_ที่นี่
+DEEPSEEK_MODEL=deepseek-flash
+GEMINI_API_KEY=คีย์_Gemini_เดิม
+GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+```
+
+DeepSeek ตีความคำถามต่อเนื่องและตอบจากหลักฐาน โดยเรียก
+`https://api.deepseek.com/chat/completions` ปิด thinking และใช้ JSON Output
+คำถามทั่วไปเรียกสร้างคำตอบหนึ่งครั้ง ส่วนคำถามต่อเนื่องอาจเรียกตีความเพิ่มอีกหนึ่งครั้ง
+Gemini ใช้เฉพาะ embedding เอกสารและ embedding คำถามสำหรับค้นข้อมูล
+`GEMINI_EMBEDDING_MODEL` ค่าเริ่มต้นคือ
 `gemini-embedding-001` ขนาด 768 มิติ ต้องใช้โมเดลเดียวกันกับการค้นคำถาม
 การสร้าง embedding จะส่งข้อความเอกสารให้ Gemini API
-โมเดลตอบมี `GEMINI_FALLBACK_MODEL` สำรองเมื่อบริการหลักไม่พร้อม
+การเปลี่ยนคีย์ DeepSeek ไม่ทำให้ดัชนี embedding ถูกสร้างใหม่
+`GEMINI_MODEL` และ `GEMINI_FALLBACK_MODEL` ไม่ใช้สำหรับตอบคำถามแล้ว
+หาก DeepSeek แจ้งเครดิตไม่เพียงพอ ให้ตรวจยอดใน DeepSeek Platform
+หลังแก้ `.env` ให้หยุดและเปิดแชทบอทใหม่
+
+สำหรับตัวเปิด `run_local.bat` ให้ติดตั้ง dependencies ใน environment ที่ใช้จริง:
+
+```bat
+conda activate worker
+cd /d "C:\Users\Phoow\Documents\workaw_chatbot"
+python -m pip install -r workaw\requirements.txt
+python -m streamlit run workaw\app.py
+```
 
 ## ฐานความรู้และ embedding
 
@@ -41,8 +66,10 @@ python workaw/rag.py --query "เรียนทั้งหมดกี่ห�
 
 ไฟล์ที่ตรวจสอบได้โดยตรงคือ `workaw/embeddings/curriculum_embeddings.npz`
 และ `workaw/embeddings/curriculum_metadata.json` ซึ่งเป็นสำเนาที่ระบบอัปเดต
-จาก cache ล่าสุด ไฟล์เวกเตอร์มี 628 แถว × 768 มิติ และ metadata เก็บข้อความ
+จาก cache ล่าสุด ไฟล์เวกเตอร์ปัจจุบันมี 629 แถว × 768 มิติ และ metadata เก็บข้อความ
 แต่ละส่วน เลขหน้า หมวด และ SHA-256 ของเอกสารต้นทาง
+หาก `.rag_cache` หาย ระบบกู้ดัชนีจากไฟล์สองไฟล์นี้เมื่อ SHA-256 โมเดล ขนาดเวกเตอร์
+รุ่น parser และรายการข้อความตรงกัน โดยไม่เรียกสร้าง embedding เอกสารซ้ำ
 
 ## โครงสร้าง
 
@@ -67,6 +94,14 @@ python workaw/rag.py --query "เรียนทั้งหมดกี่ห�
 ```powershell
 python -m unittest discover -s workaw/tests -v
 ```
+
+เมื่อใส่คีย์ทั้งสองบริการและมีเครดิต DeepSeek แล้ว ตรวจคำถามทั่วไปและคำถามต่อเนื่องได้ด้วย:
+
+```powershell
+python workaw/tests/verify_live.py --smoke
+```
+
+การตรวจสอบจริงเรียก API และคิดค่าใช้จ่ายตามการใช้งาน ส่วนชุด unittest ใช้บริการจำลอง
 
 ตรวจแบบเรียก API จริงหลังสร้าง index ครบด้วย `python workaw/tests/verify_live.py`
 ซึ่งตรวจหน่วยกิต คำถามต่อเนื่อง แผนเรียน คุณสมบัติผู้สมัคร การเปลี่ยนเรื่อง

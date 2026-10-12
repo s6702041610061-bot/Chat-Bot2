@@ -1,15 +1,14 @@
 """Conversation and answer generation, independent of the Streamlit UI."""
 import json
-import os
 import re
 import time
 
-from google.genai import errors, types
+import httpx
 
 from prompt import PROMPT_CURRICULUM, QUERY_PROMPT
 
-DEFAULT_MODEL = "gemini-3.5-flash"
-FALLBACK_MODEL = "gemini-3.5-flash"
+DEFAULT_MODEL = "deepseek-flash"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 QUERY_SCHEMA = {
     "type": "object", "properties": {
         "question": {"type": "string"},
@@ -47,39 +46,65 @@ def add_contact_fallback(message: str) -> str:
     return f"{message}\n\n{CONTACT_FALLBACK}".strip()
 
 
+def create_chat_client(api_key: str) -> httpx.Client:
+    return httpx.Client(base_url=DEEPSEEK_BASE_URL, timeout=60.0,
+                        headers={"Authorization": f"Bearer {api_key}"})
+
+
+def validate_json_result(result: dict, schema: dict) -> None:
+    if not isinstance(result, dict) or any(key not in result for key in schema["required"]):
+        raise ValueError("รูปแบบคำตอบไม่ครบถ้วน")
+    for key, specification in schema["properties"].items():
+        value = result.get(key)
+        kind = specification["type"]
+        if ((kind == "string" and not isinstance(value, str)) or
+                (kind == "boolean" and not isinstance(value, bool)) or
+                (kind == "array" and (not isinstance(value, list) or
+                                      any(not isinstance(item, str) for item in value)))):
+            raise ValueError("ชนิดข้อมูลคำตอบไม่ถูกต้อง")
+
+
 def generate_json(client, model_name: str, instruction: str, payload: str, schema: dict) -> dict:
-    last_error = None
-    fallback = os.getenv("GEMINI_FALLBACK_MODEL", FALLBACK_MODEL).strip() or FALLBACK_MODEL
-    for model in dict.fromkeys([model_name, fallback]):
-        for attempt in range(3):
-            try:
-                config = types.GenerateContentConfig(
-                    system_instruction=instruction, temperature=0.1,
-                    max_output_tokens=4096, response_mime_type="application/json",
-                    response_schema=schema)
-                if 'gemini-3' in model:
-                    config.thinking_config = types.ThinkingConfig(thinking_level="low")
-                response = client.models.generate_content(model=model, contents=payload, config=config)
-                result = json.loads(response.text or "")
-                if not isinstance(result, dict):
-                    raise ValueError("รูปแบบคำตอบไม่ถูกต้อง")
-                return result
-            except errors.APIError as error:
-                if error.code not in (404, 429, 500, 502, 503, 504):
-                    raise
-                last_error = error
-                if error.code == 404:
-                    break
-                if error.code == 429 and 'PerDay' in str(error.details):
-                    break  # Retrying cannot recover an exhausted daily quota.
-                if attempt < 2:
-                    time.sleep(2 ** (attempt + 1))
-            except (ValueError, json.JSONDecodeError) as error:
-                last_error = error
-    message = ("โควตาของบริการตอบคำถามหมด กรุณาตรวจโควตาบัญชี Gemini หรือรอรอบโควตาใหม่"
-               if isinstance(last_error, errors.APIError) and last_error.code == 429
-               else "บริการตอบคำถามยังไม่พร้อม กรุณาลองใหม่อีกครั้ง")
-    raise ChatServiceError(message) from last_error
+    example = ({"question": "คำถามสำหรับค้นข้อมูล", "needs_clarification": False, "clarification": ""}
+               if "question" in schema["properties"] else
+               {"answer": "คำตอบจากหลักฐาน", "source_ids": ["S1"]})
+    instruction += ("\nตอบเป็น JSON object ตาม schema นี้: " + json.dumps(schema, ensure_ascii=False)
+                    + "\nตัวอย่าง JSON: " + json.dumps(example, ensure_ascii=False))
+    request = {
+        "model": model_name,
+        "messages": [{"role": "system", "content": instruction},
+                     {"role": "user", "content": payload}],
+        "thinking": {"type": "disabled"}, "temperature": 0.1,
+        "max_tokens": 4096, "response_format": {"type": "json_object"}, "stream": False,
+    }
+    last_status = None
+    for attempt in range(3):
+        try:
+            response = client.post("/chat/completions", json=request)
+            response.raise_for_status()
+            choice = response.json()["choices"][0]
+            if choice.get("finish_reason") != "stop":
+                raise ValueError("คำตอบยังไม่สมบูรณ์")
+            result = json.loads(choice["message"]["content"] or "")
+            validate_json_result(result, schema)
+            return result
+        except httpx.HTTPStatusError as error:
+            last_status = error.response.status_code
+            messages = {
+                401: "คีย์ DeepSeek ไม่ถูกต้อง กรุณาตรวจ DEEPSEEK_API_KEY",
+                402: "เครดิต DeepSeek ไม่เพียงพอ กรุณาตรวจยอดเงินหรือเติมเครดิต",
+                404: "ไม่พบโมเดล DeepSeek ที่ตั้งค่าไว้ กรุณาตรวจ DEEPSEEK_MODEL",
+            }
+            if last_status not in (429, 500, 502, 503, 504):
+                raise ChatServiceError(messages.get(last_status,
+                    "บริการตอบคำถามไม่สามารถรับคำขอนี้ได้ กรุณาตรวจการตั้งค่า")) from None
+        except (httpx.TransportError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+            last_status = None
+        if attempt < 2:
+            time.sleep(2 ** (attempt + 1))
+    message = ("บริการตอบคำถามได้รับคำขอมากเกินไป กรุณารอสักครู่แล้วลองใหม่"
+               if last_status == 429 else "บริการตอบคำถามยังไม่พร้อม กรุณาลองใหม่อีกครั้ง")
+    raise ChatServiceError(message) from None
 
 
 def rewrite_question(client, model: str, question: str, history: list[dict]) -> dict:
@@ -103,12 +128,13 @@ def rewrite_question(client, model: str, question: str, history: list[dict]) -> 
     return result
 
 
-def answer_question(client, index, model: str, question: str, history: list[dict], top_k: int = 8) -> dict:
+def answer_question(client, index, model: str, question: str, history: list[dict], top_k: int = 8,
+                    *, embedding_client) -> dict:
     rewritten = rewrite_question(client, model, question, history)
     if rewritten["needs_clarification"]:
         return {"content": rewritten["clarification"], "sources": [], "search_question": ""}
     search_question = rewritten["question"]
-    retrieved = index.search(client, search_question, top_k)
+    retrieved = index.search(embedding_client, search_question, top_k)
     sources = {f"S{i}": chunk for i, (chunk, _) in enumerate(retrieved, 1)}
     evidence = [{"id": key, "reference": chunk.label, "content": chunk.text}
                 for key, chunk in sources.items()]
