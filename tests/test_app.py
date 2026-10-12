@@ -54,8 +54,8 @@ class AppTests(unittest.TestCase):
         self.assertIn('https://ced.kmutnb.ac.th/', app.error[0].value)
         self.assertIn('ต่อ 3240', app.error[0].value)
 
-    def test_missing_each_service_key_disables_chat(self):
-        for missing in ('GEMINI_API_KEY', 'DEEPSEEK_API_KEY'):
+    def test_missing_chat_key_disables_chat(self):
+        for missing in ('DEEPSEEK_API_KEY',):
             with self.subTest(missing=missing), patch.dict(os.environ, {
                 'GEMINI_API_KEY': '' if missing == 'GEMINI_API_KEY' else 'embedding-test',
                 'GEMINI_API_KEY_INSURVERSE': '',
@@ -65,6 +65,13 @@ class AppTests(unittest.TestCase):
                 self.assertFalse(app.exception)
                 self.assertTrue(app.chat_input[0].disabled)
                 self.assertIn(missing, app.warning[0].value)
+
+    @patch.dict(os.environ, {'GEMINI_API_KEY': '', 'GEMINI_API_KEY_INSURVERSE': '', 'DEEPSEEK_API_KEY': 'chat-test'})
+    def test_missing_gemini_key_keeps_chat_available(self):
+        app = AppTest.from_file(str(BASE/'app.py')).run(timeout=15)
+        self.assertFalse(app.exception)
+        self.assertFalse(app.chat_input[0].disabled)
+        self.assertTrue(app.warning)
 
 
 if __name__ == '__main__':

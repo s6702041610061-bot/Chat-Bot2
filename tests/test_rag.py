@@ -54,13 +54,13 @@ class RagTests(unittest.TestCase):
             root = Path(folder)
             source = root / 'source.md'
             source.write_text('<!-- source-page: 005; printed-page: 1; category: 1 -->\n#### หลักสูตร\nข้อมูล ก', encoding='utf-8')
-            first = load_index(source, BASE/'synonyms.json', root/'cache', None)
+            first = load_index(source, BASE/'synonyms.json', root/'cache', object())
             calls = embedding.call_count
-            second = load_index(source, BASE/'synonyms.json', root/'cache', None)
+            second = load_index(source, BASE/'synonyms.json', root/'cache', object())
             self.assertEqual(calls, embedding.call_count)
             np.testing.assert_array_equal(first.vectors, second.vectors)
             source.write_text(source.read_text(encoding='utf-8') + '\nข้อมูล ข', encoding='utf-8')
-            load_index(source, BASE/'synonyms.json', root/'cache', None)
+            load_index(source, BASE/'synonyms.json', root/'cache', object())
             self.assertGreater(embedding.call_count, calls)
 
     @patch('rag.embed', return_value=np.array([[1., 0.]], dtype=np.float32))
@@ -69,10 +69,10 @@ class RagTests(unittest.TestCase):
                   Chunk('b', 'วิชาเลือกเสรี 6 หน่วยกิต', 3, '27', 31, '2569', 'main', 'วิชาเลือก', 'x.md'),
                   Chunk('c', 'หน่วยกิตรวม 142', 9, '138', 142, '2564/2569', 'comparison', 'หน่วยกิต', 'x.md')]
         index = CurriculumIndex(chunks, np.array([[1.,0.],[.8,.2],[1.,0.]]), self.synonyms, 'fake', 2)
-        current = index.search(None, 'หน่วยกิตรวม', 3)
+        current = index.search('หน่วยกิตรวม', 3, query_vector=np.array([1., 0.]))
         self.assertEqual(len(current), 1)
         self.assertIn('วิชาเลือกเสรี 6', current[0][0].text)
-        history = index.search(None, 'หน่วยกิตรวม 2564', 3)
+        history = index.search('หน่วยกิตรวม 2564', 3, query_vector=np.array([1., 0.]))
         self.assertTrue(any(c.kind == 'comparison' for c, _ in history))
 
     @patch('chatbot.generate_json')
@@ -101,7 +101,10 @@ class RagTests(unittest.TestCase):
     @patch('chatbot.generate_json')
     def test_rejects_fabricated_source_ids(self, generate):
         class Index:
-            def search(self, *args):
+            synonyms = RagTests.synonyms
+            model = 'fake'
+            dimensions = 768
+            def search(self, *args, **kwargs):
                 return [(RagTests.chunks[0], .8)]
         generate.return_value = {'answer': 'คำตอบ [S99]', 'source_ids':['S99']}
         with self.assertRaises(ValueError):
@@ -110,7 +113,10 @@ class RagTests(unittest.TestCase):
     @patch('chatbot.generate_json')
     def test_unanswered_question_adds_department_contact_once(self, generate):
         class Index:
-            def search(self, *args):
+            synonyms = RagTests.synonyms
+            model = 'fake'
+            dimensions = 768
+            def search(self, *args, **kwargs):
                 return [(RagTests.chunks[0], .8)]
         generate.return_value = {'answer': 'ไม่พบข้อมูลนี้ในเอกสารหลักสูตรที่ใช้', 'source_ids': []}
         result = answer_question(None, Index(), 'fake', 'คำถามนอกเอกสาร', [], embedding_client=None)
@@ -157,14 +163,14 @@ class RagTests(unittest.TestCase):
             root = Path(folder)
             source = root/'source.md'
             source.write_text('<!-- source-page: 005; printed-page: 1; category: 1 -->\n#### หลักสูตร\nข้อมูล ก', encoding='utf-8')
-            load_index(source, BASE/'synonyms.json', root/'cache', None)
+            load_index(source, BASE/'synonyms.json', root/'cache', object())
             # Remove only a temporary test cache, then tamper its exported provenance.
             shutil.rmtree(root/'cache')
             manifest = root/'embeddings/curriculum_metadata.json'
             metadata = json.loads(manifest.read_text(encoding='utf-8'))
             metadata['source_sha256'] = 'incorrect'
             manifest.write_text(json.dumps(metadata), encoding='utf-8')
-            load_index(source, BASE/'synonyms.json', root/'cache', None)
+            load_index(source, BASE/'synonyms.json', root/'cache', object())
             self.assertEqual(embedding.call_count, 2)
 
 

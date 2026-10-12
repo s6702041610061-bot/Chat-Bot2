@@ -1,6 +1,8 @@
 """Opt-in integration checks using DeepSeek answers and Gemini retrieval."""
 import os
 import argparse
+import logging
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 
@@ -18,15 +20,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--edge-cases', action='store_true', help='ตรวจเฉพาะการตีความและคำถามที่ไม่มีข้อมูล')
     parser.add_argument('--smoke', action='store_true', help='ตรวจคำถามทั่วไปหนึ่งข้อและคำถามต่อเนื่องหนึ่งข้อ')
+    parser.add_argument('--no-embedding', action='store_true', help='ตรวจ seed/BM25 โดยไม่ใช้ Gemini')
     args = parser.parse_args()
     load_dotenv(BASE / '.env')
     key = os.getenv('GEMINI_API_KEY') or os.getenv('GEMINI_API_KEY_INSURVERSE')
     chat_key = os.getenv('DEEPSEEK_API_KEY', '').strip()
-    if not key or not chat_key or chat_key.startswith(('ใส่', '<', 'your')):
+    if (not key and not args.no_embedding) or not chat_key or chat_key.startswith(('ใส่', '<', 'your')):
         raise SystemExit('ตั้งค่า DEEPSEEK_API_KEY และ GEMINI_API_KEY ก่อนตรวจสอบจริง')
     model = os.getenv('DEEPSEEK_MODEL', DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    with create_chat_client(chat_key) as client, genai.Client(
-            api_key=key, http_options=types.HttpOptions(timeout=60000)) as embedding_client:
+    logging.basicConfig(level=logging.INFO)
+    embedding_context = (nullcontext(None) if args.no_embedding else genai.Client(
+        api_key=key, http_options=types.HttpOptions(timeout=60000)))
+    with create_chat_client(chat_key) as client, embedding_context as embedding_client:
         index = load_index(BASE/'TCT69_Curriculum.md', BASE/'synonyms.json', BASE/'.rag_cache',
                            embedding_client, model=os.getenv('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-001'))
         history = ([{'role':'user','content':'ปีหนึ่งเทอมสองเรียนอะไร'},
@@ -40,7 +45,8 @@ def main():
             ('จบ ปวช. ไอที สมัครได้ไหม', 'เทคโนโลยีสารสนเทศ', (101,)),
         ]
         for question, required, pages in ([] if args.edge_cases else cases[:2] if args.smoke else cases):
-            result = answer_question(client, index, model, question, history, embedding_client=embedding_client)
+            result = answer_question(client, index, model, question, history,
+                                     embedding_client=None if args.no_embedding else embedding_client)
             print('QUESTION:', question)
             print('SEARCH:', result['search_question'])
             print('ANSWER:', result['content'])
@@ -60,7 +66,8 @@ def main():
             {'role':'assistant','content':'ปีหนึ่งเทอมสองมีวงจรดิจิทัลและภาษาอังกฤษ 2'}])
         assert 'หรือคอมพิวเตอร์' not in admission['question']
         print('ADMISSION_REWRITE:', admission)
-        absent = answer_question(client, index, model, 'วันเปิดรับสมัครปี 2570 คือวันที่เท่าไร', [], embedding_client=embedding_client)
+        absent = answer_question(client, index, model, 'วันเปิดรับสมัครปี 2570 คือวันที่เท่าไร', [],
+                                 embedding_client=None if args.no_embedding else embedding_client)
         print('NO_DATA:', absent['content'])
         assert any(term in absent['content'] for term in ('ไม่พบ', 'ไม่มีข้อมูล', 'ไม่ระบุ', 'ไม่ได้ระบุ'))
         assert all(term in absent['content'] for term in (

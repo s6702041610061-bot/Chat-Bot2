@@ -6,6 +6,7 @@ import time
 import httpx
 
 from prompt import PROMPT_CURRICULUM, QUERY_PROMPT
+from query_cache import resolve_vector
 
 DEFAULT_MODEL = "deepseek-flash"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -134,7 +135,8 @@ def answer_question(client, index, model: str, question: str, history: list[dict
     if rewritten["needs_clarification"]:
         return {"content": rewritten["clarification"], "sources": [], "search_question": ""}
     search_question = rewritten["question"]
-    retrieved = index.search(embedding_client, search_question, top_k)
+    search_question, query_vector = resolve_vector(index, search_question, embedding_client)
+    retrieved = index.search(search_question, top_k, query_vector=query_vector)
     sources = {f"S{i}": chunk for i, (chunk, _) in enumerate(retrieved, 1)}
     evidence = [{"id": key, "reference": chunk.label, "content": chunk.text}
                 for key, chunk in sources.items()]

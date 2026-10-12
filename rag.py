@@ -149,13 +149,13 @@ class EmbeddingServiceError(RuntimeError):
 
 def embed(client, texts: list[str], model: str, task: str, dimensions: int) -> np.ndarray:
     query = task == "RETRIEVAL_QUERY"
-    attempts = 3 if query else 6
+    attempts = 1 if query else 6
     for attempt in range(attempts):
         try:
             response = client.models.embed_content(
                 model=model, contents=texts,
                 config=types.EmbedContentConfig(task_type=task, output_dimensionality=dimensions,
-                    http_options=types.HttpOptions(timeout=15000,
+                    http_options=types.HttpOptions(timeout=4000,
                         retry_options=types.HttpRetryOptions(attempts=1)) if query else None))
             vectors = np.asarray([item.values for item in response.embeddings or []], dtype=np.float32)
             if vectors.shape != (len(texts), dimensions) or not np.isfinite(vectors).all():
@@ -249,9 +249,8 @@ class CurriculumIndex:
         self.idf = {term: math.log(1 + (len(chunks) - count + 0.5) / (count + 0.5))
                     for term, count in frequency.items()}
 
-    def search(self, client, question: str, top_k: int = 6) -> list[tuple[Chunk, float]]:
-        query = embed(client, [self.synonyms.expand(question)], self.model, "RETRIEVAL_QUERY", self.dimensions)[0]
-        semantic = self.vectors @ query
+    def search(self, question: str, top_k: int = 6, *, query_vector=None) -> list[tuple[Chunk, float]]:
+        semantic = None if query_vector is None or self.vectors is None else self.vectors @ query_vector
         lexical = np.zeros(len(self.chunks))
         for term in tokens(question, self.synonyms):
             frequency = np.asarray([doc.get(term, 0) for doc in self.documents], dtype=float)
@@ -260,7 +259,7 @@ class CurriculumIndex:
         historical = bool(re.search(r"2564|๒๕๖๔|เปรียบเทียบ|ฉบับเดิม|หลักสูตรเก่า|ปรับปรุง.*อะไร", question))
         candidates = [i for i, c in enumerate(self.chunks) if historical or c.kind != "comparison"]
         fused = Counter()
-        for scores in (semantic, lexical):
+        for scores in ((lexical,) if semantic is None else (semantic, lexical)):
             order = sorted(candidates, key=lambda i: float(scores[i]), reverse=True)
             for rank, index in enumerate(order[:40], 1):
                 if scores is lexical and scores[index] <= 0:
@@ -271,6 +270,30 @@ class CurriculumIndex:
         # official eligibility section as evidence, even if OCR-heavy appendices
         # receive higher semantic scores for a short query.
         query_terms = set(self.synonyms.terms(question))
+        # Long rewritten questions can otherwise rank practicum appendices
+        # ahead of the official semester plan when semantic search is offline.
+        normalized = normalize(question)
+        year = re.search(r'(?:ชั้น)?ปี(?:ที่)?\s*([1-4])', normalized)
+        term = re.search(r'(?:ภาคการศึกษา|ภาคเรียน|เทอม)(?:ที่)?\s*([12])', normalized)
+        year_number = year.group(1) if year else None
+        term_number = term.group(1) if term else None
+        if year_number is None:
+            for number, word in enumerate(('หนึ่ง', 'สอง', 'สาม', 'สี่'), 1):
+                if f'ปี{word}' in normalized:
+                    year_number = str(number)
+                    break
+        if term_number is None:
+            for number, word in enumerate(('แรก', 'สอง'), 1):
+                if f'เทอม{word}' in normalized:
+                    term_number = str(number)
+                    break
+        if (year_number and term_number and not historical and
+                re.search(r'เรียน(?:วิชา)?อะไร|รายวิชา|วิชาอะไร|วิชาใด|แผน|กี่หน่วยกิต', normalized)):
+            heading = f'ปีที่ {year_number} ภาคการศึกษาที่ {term_number}'
+            plan = next((i for i, c in enumerate(self.chunks)
+                         if c.category == 3 and c.heading == heading), None)
+            if plan is not None:
+                selected = ([plan] + [i for i in selected if i != plan])[:top_k]
         applicant_terms = {"คุณสมบัติผู้สมัคร", "มัธยมศึกษาปีที่ 6",
                            "ประกาศนียบัตรวิชาชีพ", "ประกาศนียบัตรวิชาชีพชั้นสูง"}
         applicant_intent = bool(query_terms & applicant_terms) and bool(re.search(
@@ -314,7 +337,7 @@ class CurriculumIndex:
                                         if self.chunks[j].pdf_page == chunk.pdf_page)
                 chunk = Chunk(chunk.id, page_text, chunk.category, chunk.printed_page,
                               chunk.pdf_page, chunk.status, chunk.kind, chunk.heading, chunk.source)
-            results.append((chunk, float(semantic[i])))
+            results.append((chunk, float(lexical[i] if semantic is None else semantic[i])))
             seen_pages.add(chunk.pdf_page)
         return results
 
@@ -365,6 +388,9 @@ def load_index(source: Path, synonyms_path: Path, cache_dir: Path, client,
             temporary_manifest.replace(manifest)
             vectors = candidate
     if vectors is None:
+        if client is None:
+            # Retrieval remains available without rebuilding documents online.
+            return CurriculumIndex(chunks, None, Synonyms(synonyms_path), model, dimensions)
         vectors = np.empty((len(chunks), dimensions), dtype=np.float32)
         filled = np.zeros(len(chunks), dtype=bool)
 
@@ -442,6 +468,7 @@ def main():
     load_dotenv(base / ".env")
     parser = argparse.ArgumentParser(description="สร้าง embedding ของหลักสูตร หรือทดลองค้นข้อมูล")
     parser.add_argument("--query")
+    parser.add_argument("--build-query-cache", action="store_true")
     parser.add_argument("--rebuild", action="store_true",
                         help="สร้าง embedding ใหม่ทั้งหมดโดยไม่ใช้เวกเตอร์จาก cache เดิม")
     args = parser.parse_args()
@@ -449,13 +476,20 @@ def main():
     if not key:
         raise SystemExit("กรุณาตั้งค่า GEMINI_API_KEY ใน workaw/.env")
     with genai.Client(api_key=key, http_options=types.HttpOptions(timeout=60000)) as client:
+        if args.build_query_cache:
+            from query_cache import build_seed
+            build_seed(client, Synonyms(base/'synonyms.json'),
+                       os.getenv('GEMINI_EMBEDDING_MODEL', EMBEDDING_MODEL), DIMENSIONS)
+            return
         index = load_index(base / "TCT69_Curriculum.md", base / "synonyms.json", base / ".rag_cache", client,
                            model=os.getenv("GEMINI_EMBEDDING_MODEL", EMBEDDING_MODEL),
                            progress=lambda done, total: print(f"Embedding {done}/{total}", flush=True),
                            force_rebuild=args.rebuild)
         print(f"Index ready: {len(index.chunks)} chunks, {index.dimensions} dimensions")
         if args.query:
-            for chunk, score in index.search(client, args.query):
+            from query_cache import resolve_vector
+            question, vector = resolve_vector(index, args.query, client)
+            for chunk, score in index.search(question, query_vector=vector):
                 print(f"{score:.3f} {chunk.label}\n{chunk.text[:500]}\n")
 
 

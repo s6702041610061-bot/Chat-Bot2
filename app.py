@@ -2,6 +2,7 @@
 import hashlib
 import html
 import os
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -20,6 +21,7 @@ PROFILE_PATH = BASE_DIR / "assets" / "cyra-profile.jpg"
 GREETING = ("สวัสดีค่ะ ฉันชื่อ CYRA (ไซรา) ผู้ช่วยตอบคำถามเกี่ยวกับหลักสูตร"
             "เทคโนโลยีคอมพิวเตอร์ พ.ศ. 2569 ยินดีช่วยค้นหาข้อมูลให้ค่ะ")
 load_dotenv(BASE_DIR / ".env")
+logging.getLogger('query_cache').setLevel(logging.INFO)
 
 
 def apply_styles():
@@ -531,6 +533,8 @@ def render_header():
 
 @st.cache_resource(show_spinner=False)
 def get_embedding_client(api_key: str):
+    if not api_key or api_key.startswith(("ใส่", "<", "your")):
+        return None
     return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=60000))
 
 
@@ -615,9 +619,9 @@ def main():
     if not chat_key or chat_key.startswith(("ใส่", "<", "your")):
         missing.append("DEEPSEEK_API_KEY สำหรับตอบคำถาม")
     if not embedding_key or embedding_key.startswith(("ใส่", "<", "your")):
-        missing.append("GEMINI_API_KEY สำหรับค้นด้วย embedding")
+        st.warning("การค้นตามความหมายยังไม่พร้อม ระบบจะใช้คำถามที่เตรียมไว้และค้นด้วยคำสำคัญ")
     if missing:
-        st.warning("กรุณาตั้งค่า " + " และ ".join(missing) + " ใน workaw/.env ก่อนเริ่มสนทนา")
+        st.warning("กรุณาตั้งค่า " + " และ ".join(missing) + " ใน Streamlit Cloud Secrets หรือ .env ก่อนเริ่มสนทนา")
         st.chat_input("พิมพ์คำถามเกี่ยวกับหลักสูตร", disabled=True)
         return
     pending = st.session_state["messages"][-1]["role"] == "user"

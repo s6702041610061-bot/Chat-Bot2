@@ -38,11 +38,11 @@ class DeepSeekTests(unittest.TestCase):
         embedding_client = object()
         index = Mock()
         index.search.return_value = [(chunk, .9)]
-        with httpx.Client(base_url='https://api.deepseek.com', headers={'Authorization': 'Bearer chat-test'},
+        with patch('chatbot.resolve_vector', return_value=('อาจารย์ในภาควิชามีใครบ้าง', None)), httpx.Client(base_url='https://api.deepseek.com', headers={'Authorization': 'Bearer chat-test'},
                           transport=httpx.MockTransport(handler)) as chat_client:
             result = answer_question(chat_client, index, 'deepseek-flash', 'แล้วมีใครบ้าง',
                 [{'role': 'user', 'content': 'ภาควิชามีอาจารย์กี่คน'}], embedding_client=embedding_client)
-        index.search.assert_called_once_with(embedding_client, 'อาจารย์ในภาควิชามีใครบ้าง', 8)
+        index.search.assert_called_once_with('อาจารย์ในภาควิชามีใครบ้าง', 8, query_vector=None)
         self.assertEqual(len(requests), 2)
         self.assertNotIn('[S1]', result['content'])
         self.assertEqual(result['sources'][0]['id'], 'S1')

@@ -5,6 +5,35 @@
 รายการใน `synonyms.json` ใช้ขยายคำค้น ไม่ใช่แหล่งข้อเท็จจริง
 ประวัติสนทนาใช้เติมบริบทคำถามต่อเนื่อง แล้วค้นหลักฐานใหม่ทุกครั้ง
 
+## Query vector cache และการค้นสำรอง
+
+คำถามหลังตีความจะผ่านการ normalize และจับ alias ก่อนค้น seed vector ที่จัดส่ง
+พร้อมแอป: 50 คำถามมาตรฐาน รวม 100 รูปแบบ อยู่ใน `seed_questions.json`
+และ `embeddings/query_embeddings.npz` พร้อม manifest `query_metadata.json`
+สร้างหรืออัปเดต seed ด้วย `python workaw/rag.py --build-query-cache` โดยใช้
+Gemini แบบ batch 16 ข้อ เก็บแต่ละ batch เพื่อทำต่อได้เมื่อบริการขัดข้อง
+คำสั่งนี้มีค่าใช้จ่าย API แต่การเปิดแอปหรือ deploy ไม่เรียกสร้าง seed อัตโนมัติ
+
+คำถามใหม่เก็บผ่าน `st.cache_data(persist="disk", max_entries=2000)` โดย key
+ประกอบด้วยรุ่น cache โมเดล มิติ task และข้อความหลังขยาย synonyms ไม่รวมคีย์ API
+เปลี่ยนคีย์จึงใช้ vector เดิมต่อได้ ผลล้มเหลวไม่ถูก cache คำถามคนละภาคเรียน
+และเงื่อนไขไม่ถูกรวมเข้าด้วยกัน การแก้ synonyms ทำให้ข้อความ embedding ใหม่
+ไม่ตรง cache เดิม และ seed เก่าจะถูกข้ามจนสร้างใหม่
+
+บน Streamlit Cloud runtime cache อาจหายเมื่อ redeploy/ย้าย instance แต่ seed
+ที่ commit พร้อมแอปยังอยู่ ขีดจำกัด 2000 รายการใช้กับ cache ในหน่วยความจำ
+ไม่ใช่การรับประกันขนาดไฟล์ cache บนดิสก์ ไม่มีการเก็บประวัติผู้ใช้ใน seed
+
+เมื่อ cache miss เรียก Gemini เพียงครั้งเดียว ตั้ง timeout 4 วินาทีและปิด retry
+ถ้าโควตาหมด คีย์ผิด เครือข่ายล้มเหลว หรือ vector ไม่สมบูรณ์ จะค้นด้วย BM25 ต่อ
+DeepSeek ยังอ่านหลักฐานใหม่ทุกครั้ง ไม่ cache คำตอบ และไม่แต่งข้อมูลเมื่อค้นไม่พบ
+การไม่มี Gemini key ไม่ปิดแชต ส่วน DeepSeek key ยังต้องตั้งค่าใน Cloud Secrets
+หรือ `.env` Log แสดง source (`seed`, `runtime`, `gemini`, `bm25_fallback`) และเวลา
+โดยไม่แสดงคีย์หรือข้อความคำถาม
+
+ตรวจสอบการตอบจริงโดยไม่เรียก Gemini ได้ด้วย
+`python workaw/tests/verify_live.py --no-embedding` (ยังเรียก DeepSeek และใช้เครดิต)
+
 ## เริ่มใช้งาน
 
 เปิด `run_local.bat` จากโฟลเดอร์โครงการ ซึ่งใช้ environment `worker` เดิม
