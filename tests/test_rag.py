@@ -155,6 +155,50 @@ class RagTests(unittest.TestCase):
             np.testing.assert_array_equal(restored.vectors, again.vectors)
             embedding.assert_not_called()
 
+    def test_financial_search_uses_relevance_after_external_section_expands(self):
+        index = CurriculumIndex(self.chunks, None, self.synonyms, 'fake', 768)
+        for question, required in [
+            ('กยศ. ผู้กู้รายใหม่มีใครบ้าง', 'ผู้เปลี่ยนระดับการศึกษา'),
+            ('ทุนการศึกษา เอกสารประกอบการสมัครทุนมีอะไรบ้าง', 'หนังสือรับรองเงินเดือน'),
+        ]:
+            with self.subTest(question=question):
+                results = index.search(question, top_k=8)
+                self.assertIn(required, '\n'.join(c.text for c, _ in results))
+
+    def test_credit_overview_uses_official_structure_without_semantic_search(self):
+        index = CurriculumIndex(self.chunks, None, self.synonyms, 'fake', 768)
+        results = index.search('เรียนทั้งหมดกี่หน่วยกิต แบ่งเป็นหมวดอะไรบ้าง', top_k=8)
+        self.assertEqual(results[0][0].pdf_page, 31)
+        for fact in ('139 หน่วยกิต', '24 หน่วยกิต', '109 หน่วยกิต', '6 หน่วยกิต'):
+            self.assertIn(fact, results[0][0].text)
+
+    def test_external_citations_keep_their_own_topic_and_evidence(self):
+        index = CurriculumIndex(self.chunks, None, self.synonyms, 'fake', 768)
+        originals = {c.id: c for c in self.chunks}
+        results = index.search('จาก MRT เตาปูนไป มจพ. ต่อรถเมล์สายอะไร', top_k=8)
+        external = [c for c, _ in results if c.kind == 'external']
+        self.assertGreater(len(external), 1)
+        for chunk in external:
+            self.assertEqual(chunk.text, originals[chunk.id].text)
+            self.assertEqual(chunk.heading, originals[chunk.id].heading)
+
+    @patch('rag.embed')
+    def test_zero_runtime_cache_is_rebuilt(self, embedding):
+        embedding.side_effect = lambda client, texts, model, task, dimensions: np.ones(
+            (len(texts), dimensions), dtype=np.float32) / np.sqrt(dimensions)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root/'source.md'
+            source.write_text('<!-- source-page: 005; printed-page: 1; category: 1 -->\n#### หลักสูตร\nข้อมูล ก', encoding='utf-8')
+            load_index(source, BASE/'synonyms.json', root/'cache', object())
+            cache = next((root/'cache').glob('*.npz'))
+            np.savez_compressed(cache, vectors=np.zeros((1, 768), dtype=np.float32))
+            # A damaged runtime cache and absent export must trigger new embeddings.
+            shutil.rmtree(root/'embeddings')
+            restored = load_index(source, BASE/'synonyms.json', root/'cache', object())
+            self.assertTrue(np.all(np.linalg.norm(restored.vectors, axis=1) > 0))
+            self.assertEqual(embedding.call_count, 2)
+
     @patch('rag.embed')
     def test_exported_index_with_wrong_provenance_is_not_reused(self, embedding):
         embedding.side_effect = lambda client, texts, model, task, dimensions: np.ones(

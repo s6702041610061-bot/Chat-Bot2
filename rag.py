@@ -217,7 +217,8 @@ def cached_chunk_vectors(cache_dir: Path, current_cache: Path, model: str,
                 continue
             with np.load(vector_path, allow_pickle=False) as saved:
                 vectors = saved["vectors"]
-            if vectors.shape != (len(records), dimensions) or not np.isfinite(vectors).all():
+            if (vectors.shape != (len(records), dimensions) or not np.isfinite(vectors).all()
+                    or not np.all(np.linalg.norm(vectors, axis=1) > 0)):
                 continue
             for record, vector in zip(records, vectors):
                 key = hashlib.sha256(embedding_text(record).encode("utf-8")).hexdigest()
@@ -294,6 +295,14 @@ class CurriculumIndex:
                          if c.category == 3 and c.heading == heading), None)
             if plan is not None:
                 selected = ([plan] + [i for i in selected if i != plan])[:top_k]
+        overview_intent = ('หน่วยกิตรวมตลอดหลักสูตร' in query_terms or bool(re.search(
+            r'โครงสร้างหลักสูตร|แบ่ง.*หมวด|เรียนทั้งหมดกี่หน่วยกิต|รวมตลอดหลักสูตร', normalized)))
+        if overview_intent and not historical and not (year_number and term_number):
+            overview = next((i for i, chunk in enumerate(self.chunks)
+                             if chunk.category == 3 and
+                             'จำนวนหน่วยกิตที่เรียน รวมตลอดหลักสูตร' in chunk.heading), None)
+            if overview is not None:
+                selected = ([overview] + [i for i in selected if i != overview])[:top_k]
         applicant_terms = {"คุณสมบัติผู้สมัคร", "มัธยมศึกษาปีที่ 6",
                            "ประกาศนียบัตรวิชาชีพ", "ประกาศนียบัตรวิชาชีพชั้นสูง"}
         applicant_intent = bool(query_terms & applicant_terms) and bool(re.search(
@@ -317,7 +326,10 @@ class CurriculumIndex:
                 selected = selected[:top_k]
         financial_terms = {"กยศ.", "ทุนการศึกษา", "สามารถกู้"}
         if query_terms & financial_terms:
-            external = [i for i, chunk in enumerate(self.chunks) if chunk.kind == "external"]
+            # Prefer relevant external evidence, not its document order. This
+            # section now contains many unrelated services before scholarships.
+            external = sorted((i for i in fused if self.chunks[i].kind == "external"),
+                              key=fused.get, reverse=True)
             selected = external + [i for i in selected if i not in external]
             selected = selected[:top_k]
         # Include the full page when compact: a plan/table split into chunks must
@@ -325,6 +337,11 @@ class CurriculumIndex:
         results, seen_pages = [], set()
         for i in selected:
             chunk = self.chunks[i]
+            # External topics share synthetic page 900, not a real source page.
+            # Keep their headings and evidence separate for accurate citations.
+            if chunk.kind == "external":
+                results.append((chunk, float(lexical[i] if semantic is None else semantic[i])))
+                continue
             if chunk.pdf_page in seen_pages:
                 continue
             same_page = [c for c in self.chunks if c.pdf_page == chunk.pdf_page]
@@ -356,7 +373,8 @@ def load_index(source: Path, synonyms_path: Path, cache_dir: Path, client,
         try:
             with np.load(cache, allow_pickle=False) as saved:
                 candidate = saved["vectors"]
-                if candidate.shape == (len(chunks), dimensions) and np.isfinite(candidate).all():
+                if (candidate.shape == (len(chunks), dimensions) and np.isfinite(candidate).all()
+                        and np.all(np.linalg.norm(candidate, axis=1) > 0)):
                     vectors = candidate
         except (ValueError, OSError, KeyError):
             pass
@@ -405,7 +423,8 @@ def load_index(source: Path, synonyms_path: Path, cache_dir: Path, client,
                     continue
                 try:
                     candidate = np.load(part_path, allow_pickle=False)
-                    if candidate.shape == (stop - start, dimensions) and np.isfinite(candidate).all():
+                    if (candidate.shape == (stop - start, dimensions) and np.isfinite(candidate).all()
+                            and np.all(np.linalg.norm(candidate, axis=1) > 0)):
                         vectors[start:stop] = candidate
                         filled[start:stop] = True
                 except (ValueError, OSError):

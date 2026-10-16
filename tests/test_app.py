@@ -66,6 +66,25 @@ class AppTests(unittest.TestCase):
                 self.assertTrue(app.chat_input[0].disabled)
                 self.assertIn(missing, app.warning[0].value)
 
+    @patch.dict(os.environ, {'GEMINI_API_KEY': 'test-key', 'DEEPSEEK_API_KEY': 'test-chat-key'})
+    @patch('google.genai.Client')
+    @patch('rag.load_index')
+    @patch('chatbot.answer_question')
+    def test_retry_recovers_without_duplicate_question(self, answer, index, client):
+        answer.side_effect = [RuntimeError('private detail'), {
+            'content': 'เรียนรวม 139 หน่วยกิต', 'sources': [], 'search_question': 'เรียนกี่หน่วยกิต'}]
+        app = AppTest.from_file(str(BASE/'app.py')).run(timeout=15)
+        app.chat_input[0].set_value('เรียนกี่หน่วยกิต').run(timeout=15)
+        retry = next(b for b in app.button if 'ลองตอบคำถามล่าสุด' in b.label)
+        retry.click().run(timeout=15)
+        self.assertFalse(app.exception)
+        self.assertFalse(app.error)
+        self.assertFalse(app.chat_input[0].disabled)
+        self.assertEqual(len(app.chat_message), 2)
+        messages = app.session_state['messages']
+        self.assertEqual(sum(m['role'] == 'user' for m in messages), 1)
+        self.assertEqual(messages[-1]['content'], 'เรียนรวม 139 หน่วยกิต')
+
     @patch.dict(os.environ, {'GEMINI_API_KEY': '', 'GEMINI_API_KEY_INSURVERSE': '', 'DEEPSEEK_API_KEY': 'chat-test'})
     def test_missing_gemini_key_keeps_chat_available(self):
         app = AppTest.from_file(str(BASE/'app.py')).run(timeout=15)
